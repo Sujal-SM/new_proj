@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+.npm
+*.env
+backend.env
+.env*
+!.env.example
+dist
+.git
+.gitignore
+README.md
+test-samples
+*.test.js
+*.spec.js
+.DS_Store
+Thumbs.db

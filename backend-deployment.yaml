@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: linksort
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0          # zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      # Pull image from OCIR using imagePullSecret
+      imagePullSecrets:
+        - name: ocir-secret
+
+      containers:
+        - name: backend
+          # Updated by CI/CD: <region>.ocir.io/<namespace>/linksort-backend:<sha>
+          image: <region>.ocir.io/<tenancy-namespace>/linksort-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+
+          # Inject all env vars from secret
+          envFrom:
+            - secretRef:
+                name: backend-secret
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # Liveness: restart pod if app is stuck
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+
+          # Readiness: don't send traffic until app is ready
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: linksort
+spec:
+  selector:
+    app: backend
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+  type: ClusterIP          # internal only — frontend accesses via nginx proxy

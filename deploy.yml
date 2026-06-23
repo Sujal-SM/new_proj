@@ -1,0 +1,150 @@
+name: Build & Deploy to OCI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  OCI_REGION: ap-mumbai-1                          # ← change to your region
+  OCIR_NAMESPACE: ${{ secrets.OCIR_NAMESPACE }}    # your tenancy namespace
+  BACKEND_IMAGE: linksort-backend
+  FRONTEND_IMAGE: linksort-frontend
+  K8S_NAMESPACE: linksort
+
+jobs:
+  # ─────────────────────────────────────────
+  # Job 1: Build & Push Docker images
+  # ─────────────────────────────────────────
+  build:
+    name: Build & Push to OCIR
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag (Git SHA)
+        id: tag
+        run: echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Login to OCIR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.OCI_REGION }}.ocir.io
+          username: ${{ secrets.OCIR_USERNAME }}      # format: <namespace>/<username>
+          password: ${{ secrets.OCIR_TOKEN }}         # OCI Auth Token
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Backend ──
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.OCI_REGION }}.ocir.io/${{ env.OCIR_NAMESPACE }}/${{ env.BACKEND_IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.OCI_REGION }}.ocir.io/${{ env.OCIR_NAMESPACE }}/${{ env.BACKEND_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Frontend ──
+      - name: Build & Push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.OCI_REGION }}.ocir.io/${{ env.OCIR_NAMESPACE }}/${{ env.FRONTEND_IMAGE }}:${{ steps.tag.outputs.tag }}
+            ${{ env.OCI_REGION }}.ocir.io/${{ env.OCIR_NAMESPACE }}/${{ env.FRONTEND_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────
+  # Job 2: Deploy to OKE (only on main push)
+  # ─────────────────────────────────────────
+  deploy:
+    name: Deploy to OKE
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
+            | bash -s -- --accept-all-defaults
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_KEY_CONTENT }}" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ env.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          EOF
+
+      - name: Setup kubectl for OKE
+        run: |
+          oci ce cluster create-kubeconfig \
+            --cluster-id ${{ secrets.OKE_CLUSTER_OCID }} \
+            --file $HOME/.kube/config \
+            --region ${{ env.OCI_REGION }} \
+            --token-version 2.0.0 \
+            --kube-endpoint PUBLIC_ENDPOINT
+
+      - name: Create OCIR pull secret in K8s
+        run: |
+          kubectl create secret docker-registry ocir-secret \
+            --docker-server=${{ env.OCI_REGION }}.ocir.io \
+            --docker-username=${{ secrets.OCIR_USERNAME }} \
+            --docker-password=${{ secrets.OCIR_TOKEN }} \
+            --namespace=${{ env.K8S_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply K8s manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/secret.yaml
+          kubectl apply -f k8s/backend-deployment.yaml
+          kubectl apply -f k8s/frontend-deployment.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+      - name: Update image tags (force new rollout)
+        run: |
+          TAG=${{ needs.build.outputs.image-tag }}
+          REGION=${{ env.OCI_REGION }}
+          NS=${{ env.OCIR_NAMESPACE }}
+
+          kubectl set image deployment/backend \
+            backend=${REGION}.ocir.io/${NS}/${{ env.BACKEND_IMAGE }}:${TAG} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+          kubectl set image deployment/frontend \
+            frontend=${REGION}.ocir.io/${NS}/${{ env.FRONTEND_IMAGE }}:${TAG} \
+            -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/backend -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+          kubectl rollout status deployment/frontend -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+
+      - name: Show running pods
+        run: kubectl get pods -n ${{ env.K8S_NAMESPACE }}

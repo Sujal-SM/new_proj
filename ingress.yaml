@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────
+# OCI ALB Ingress — routes external traffic to frontend & backend
+# Requires OCI Ingress Controller installed on OKE
+# ─────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: linksort-ingress
+  namespace: linksort
+  annotations:
+    # OCI Native Ingress Controller annotations
+    oci.oraclecloud.com/load-balancer-type: "lb"
+    oci.oraclecloud.com/security-list-management-mode: "All"
+    # Uncomment below for HTTPS with OCI Certificate Service
+    # oci.oraclecloud.com/oci-native-ingress-tls-secret: "tls-secret"
+spec:
+  ingressClassName: native          # OCI native ingress class
+  rules:
+    - http:
+        paths:
+          # All /api/* → backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 3000
+
+          # Everything else → frontend
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
